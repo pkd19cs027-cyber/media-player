@@ -1,10 +1,10 @@
 name: flix_local
 description: A Netflix-style local video player application for mobile.
-publish_to: 'none'
+publish_to: "none"
 version: 1.0.0+1
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
@@ -24,6 +24,8 @@ dependencies:
   mime: ^1.0.5
   video_thumbnail: ^0.5.3
   google_fonts: ^6.2.1
+  permission_handler: ^11.3.1
+  screen_brightness: ^2.1.7
 
 dev_dependencies:
   flutter_test:

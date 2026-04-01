@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/video_model.dart';
 
@@ -15,9 +16,21 @@ class VideoProvider extends ChangeNotifier {
   String _searchQuery = '';
   String _selectedCategory = 'All';
   int _currentNavIndex = 0;
+  DateTime? _lastProgressPersistAt;
+
+  static const Duration _progressPersistInterval = Duration(seconds: 10);
 
   static const List<String> supportedExtensions = [
-    'mp4', 'mkv', 'avi', 'mov', 'wmv', 'flv', 'webm', 'm4v', '3gp', 'ts'
+    'mp4',
+    'mkv',
+    'avi',
+    'mov',
+    'wmv',
+    'flv',
+    'webm',
+    'm4v',
+    '3gp',
+    'ts'
   ];
 
   // Getters
@@ -79,9 +92,7 @@ class VideoProvider extends ChangeNotifier {
           .where((v) => v.exists)
           .toList();
 
-      _recentlyPlayed = _videos
-          .where((v) => v.playCount > 0)
-          .toList()
+      _recentlyPlayed = _videos.where((v) => v.playCount > 0).toList()
         ..sort((a, b) => b.playCount.compareTo(a.playCount));
 
       _favorites = _videos.where((v) => v.isFavorite).toList();
@@ -102,6 +113,12 @@ class VideoProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
+      final hasPermission = await _ensureStoragePermission();
+      if (!hasPermission) {
+        debugPrint('Storage/media permission not granted for video import.');
+        return;
+      }
+
       final result = await FilePicker.platform.pickFiles(
         type: FileType.custom,
         allowedExtensions: supportedExtensions,
@@ -109,19 +126,25 @@ class VideoProvider extends ChangeNotifier {
       );
 
       if (result != null && result.files.isNotEmpty) {
+        var addedCount = 0;
         for (final file in result.files) {
           if (file.path != null) {
-            await _addVideo(file.path!);
+            if (await _addVideo(file.path!)) {
+              addedCount++;
+            }
           }
         }
-        await _saveToPrefs();
+        debugPrint('Pick videos completed. Added $addedCount items.');
+        if (addedCount > 0) {
+          await _saveToPrefs();
+        }
       }
     } catch (e) {
       debugPrint('Error picking videos: $e');
+    } finally {
+      _isLoading = false;
+      notifyListeners();
     }
-
-    _isLoading = false;
-    notifyListeners();
   }
 
   Future<void> pickFolder() async {
@@ -129,39 +152,66 @@ class VideoProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
+      final hasPermission = await _ensureStoragePermission();
+      if (!hasPermission) {
+        debugPrint('Storage/media permission not granted for folder scan.');
+        return;
+      }
+
       final result = await FilePicker.platform.getDirectoryPath();
       if (result != null) {
-        await _scanDirectory(result);
-        await _saveToPrefs();
+        final addedCount = await _scanDirectory(result);
+        debugPrint(
+            'Folder scan completed. Added $addedCount items from: $result');
+        if (addedCount > 0) {
+          await _saveToPrefs();
+        }
       }
     } catch (e) {
       debugPrint('Error picking folder: $e');
+    } finally {
+      _isLoading = false;
+      notifyListeners();
     }
-
-    _isLoading = false;
-    notifyListeners();
   }
 
-  Future<void> _scanDirectory(String dirPath) async {
-    final dir = Directory(dirPath);
-    if (!await dir.exists()) return;
+  Future<int> _scanDirectory(String dirPath) async {
+    final normalizedPath = _normalizeDirectoryPath(dirPath);
+    if (normalizedPath == null) {
+      debugPrint('Unsupported folder path: $dirPath');
+      return 0;
+    }
 
-    await for (final entity in dir.list(recursive: true)) {
+    final dir = Directory(normalizedPath);
+    if (!await dir.exists()) return 0;
+
+    var addedCount = 0;
+
+    final entities =
+        dir.list(recursive: true, followLinks: false).handleError((error) {
+      debugPrint('Skipping inaccessible entry while scanning: $error');
+    });
+
+    await for (final entity in entities) {
       if (entity is File) {
         final ext = p.extension(entity.path).toLowerCase().replaceAll('.', '');
         if (supportedExtensions.contains(ext)) {
-          await _addVideo(entity.path);
+          if (await _addVideo(entity.path)) {
+            addedCount++;
+          }
         }
       }
     }
+
+    return addedCount;
   }
 
-  Future<void> _addVideo(String filePath) async {
+  Future<bool> _addVideo(String filePath) async {
     // Check if already added
-    if (_videos.any((v) => v.path == filePath)) return;
+    if (_videos.any((v) => v.path == filePath)) return false;
 
     final file = File(filePath);
-    if (!await file.exists()) return;
+    if (!await file.exists()) return false;
 
     final stat = await file.stat();
     final fileName = p.basename(filePath);
@@ -177,16 +227,114 @@ class VideoProvider extends ChangeNotifier {
     );
 
     _videos.add(video);
+    return true;
   }
 
-  void updateWatchProgress(String videoId, Duration position, Duration total) {
-    final index = _videos.indexWhere((v) => v.id == videoId);
-    if (index != -1) {
-      _videos[index] = _videos[index].copyWith(watchPosition: position);
-      if (total.inMilliseconds > 0) {
-        _videos[index] = _videos[index].copyWith(duration: total);
+  Future<bool> _ensureStoragePermission() async {
+    if (!Platform.isAndroid) return true;
+
+    if (await Permission.videos.isGranted ||
+        await Permission.storage.isGranted) {
+      return true;
+    }
+
+    final videosStatus = await Permission.videos.request();
+    if (videosStatus.isGranted || videosStatus.isLimited) {
+      return true;
+    }
+
+    final storageStatus = await Permission.storage.request();
+    if (storageStatus.isGranted) {
+      return true;
+    }
+
+    return false;
+  }
+
+  String? _normalizeDirectoryPath(String rawPath) {
+    if (rawPath.isEmpty) return null;
+
+    if (!rawPath.startsWith('content://')) {
+      return rawPath;
+    }
+
+    if (!Platform.isAndroid) {
+      return null;
+    }
+
+    final uri = Uri.tryParse(rawPath);
+    if (uri == null) {
+      return null;
+    }
+
+    if (uri.authority != 'com.android.externalstorage.documents') {
+      return null;
+    }
+
+    final treeIndex = uri.pathSegments.indexOf('tree');
+    if (treeIndex == -1 || treeIndex + 1 >= uri.pathSegments.length) {
+      return null;
+    }
+
+    final documentId = Uri.decodeComponent(uri.pathSegments[treeIndex + 1]);
+    return _androidDocumentIdToPath(documentId);
+  }
+
+  String? _androidDocumentIdToPath(String documentId) {
+    final separatorIndex = documentId.indexOf(':');
+    if (separatorIndex == -1) {
+      return null;
+    }
+
+    final volume = documentId.substring(0, separatorIndex);
+    final relativePath = documentId.substring(separatorIndex + 1);
+
+    if (volume.toLowerCase() == 'primary') {
+      if (relativePath.isEmpty) {
+        return '/storage/emulated/0';
       }
+      return '/storage/emulated/0/$relativePath';
+    }
+
+    if (relativePath.isEmpty) {
+      return '/storage/$volume';
+    }
+
+    return '/storage/$volume/$relativePath';
+  }
+
+  void updateWatchProgress(String videoId, Duration position, Duration total,
+      {bool forcePersist = false}) {
+    final index = _videos.indexWhere((v) => v.id == videoId);
+    if (index == -1) return;
+
+    final currentVideo = _videos[index];
+    final normalizedPosition = Duration(seconds: position.inSeconds);
+    final normalizedDuration =
+        total.inMilliseconds > 0 ? total : currentVideo.duration;
+
+    final positionChanged =
+        currentVideo.watchPosition.inSeconds != normalizedPosition.inSeconds;
+    final durationChanged = currentVideo.duration != normalizedDuration;
+
+    if (!positionChanged && !durationChanged) return;
+
+    _videos[index] = currentVideo.copyWith(
+      watchPosition: normalizedPosition,
+      duration: normalizedDuration,
+    );
+
+    final now = DateTime.now();
+    final shouldPersist = forcePersist ||
+        _lastProgressPersistAt == null ||
+        now.difference(_lastProgressPersistAt!) >= _progressPersistInterval;
+
+    if (shouldPersist) {
+      _lastProgressPersistAt = now;
       _saveToPrefs();
+    }
+
+    if (forcePersist) {
       notifyListeners();
     }
   }
@@ -244,12 +392,24 @@ class VideoProvider extends ChangeNotifier {
     notifyListeners();
   }
 
-  void removeVideo(String videoId) {
-    _videos.removeWhere((v) => v.id == videoId);
-    _recentlyPlayed.removeWhere((v) => v.id == videoId);
-    _favorites.removeWhere((v) => v.id == videoId);
+  void removeVideos(List<String> videoIds) {
+    if (videoIds.isEmpty) return;
+
+    final ids = videoIds.toSet();
+    _videos.removeWhere((v) => ids.contains(v.id));
+    _recentlyPlayed.removeWhere((v) => ids.contains(v.id));
+    _favorites.removeWhere((v) => ids.contains(v.id));
+
+    if (_currentVideo != null && ids.contains(_currentVideo!.id)) {
+      _currentVideo = null;
+    }
+
     _saveToPrefs();
     notifyListeners();
+  }
+
+  void removeVideo(String videoId) {
+    removeVideos([videoId]);
   }
 
   void clearAll() {

@@ -1,11 +1,30 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:video_player/video_player.dart';
 import 'package:chewie/chewie.dart';
 import 'package:provider/provider.dart';
 import 'package:google_fonts/google_fonts.dart';
+import 'package:screen_brightness/screen_brightness.dart';
 import '../models/video_model.dart';
 import '../providers/video_provider.dart';
+
+enum _GestureAxis { none, horizontal, vertical }
+
+enum _VerticalGestureMode { none, brightness, volume }
+
+class _GestureHudData {
+  final IconData icon;
+  final String label;
+  final double value;
+
+  const _GestureHudData({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+}
 
 class VideoPlayerScreen extends StatefulWidget {
   final VideoModel video;
@@ -19,6 +38,19 @@ class VideoPlayerScreen extends StatefulWidget {
 class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   VideoPlayerController? _videoController;
   ChewieController? _chewieController;
+  Timer? _progressTimer;
+  Timer? _gestureHudTimer;
+  final ValueNotifier<_GestureHudData?> _gestureHudNotifier =
+      ValueNotifier<_GestureHudData?>(null);
+  late final VideoProvider _videoProvider;
+  _GestureAxis _gestureAxis = _GestureAxis.none;
+  _VerticalGestureMode _verticalGestureMode = _VerticalGestureMode.none;
+  Offset _gestureDelta = Offset.zero;
+  bool _isLeftSideGesture = false;
+  double _pendingSeekSeconds = 0;
+  double _brightnessLevel = 0.5;
+  double _volumeLevel = 1.0;
+  int _lastProgressSecond = -1;
   bool _isInitialized = false;
   bool _hasError = false;
   String _errorMessage = '';
@@ -27,6 +59,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   @override
   void initState() {
     super.initState();
+    _videoProvider = context.read<VideoProvider>();
+    _loadInitialGestureValues();
     _isFavorite = widget.video.isFavorite;
     _initPlayer();
 
@@ -46,13 +80,21 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   Future<void> _initPlayer() async {
     try {
-      _videoController = VideoPlayerController.file(widget.video.file);
+      _videoController = VideoPlayerController.file(
+        widget.video.file,
+        videoPlayerOptions: VideoPlayerOptions(
+          allowBackgroundPlayback: false,
+          mixWithOthers: false,
+        ),
+      );
       await _videoController!.initialize();
+      _volumeLevel = _videoController!.value.volume.clamp(0.0, 1.0);
 
       // Seek to last position
       if (widget.video.watchPosition > Duration.zero) {
         await _videoController!.seekTo(widget.video.watchPosition);
       }
+      _lastProgressSecond = widget.video.watchPosition.inSeconds;
 
       _chewieController = ChewieController(
         videoPlayerController: _videoController!,
@@ -67,15 +109,16 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
           backgroundColor: Colors.white24,
           bufferedColor: Colors.white38,
         ),
-        placeholder: Container(color: Colors.black),
+        placeholder: const ColoredBox(color: Colors.black),
         autoInitialize: true,
       );
 
-      // Update progress periodically
-      _videoController!.addListener(_progressListener);
+      _startProgressUpdates();
 
+      if (!mounted) return;
       setState(() => _isInitialized = true);
     } catch (e) {
+      if (!mounted) return;
       setState(() {
         _hasError = true;
         _errorMessage = 'Could not play this video.\n${e.toString()}';
@@ -83,17 +126,190 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
     }
   }
 
-  void _progressListener() {
-    if (_videoController == null) return;
-    final pos = _videoController!.value.position;
-    final dur = _videoController!.value.duration;
-    if (dur.inSeconds > 0) {
-      context.read<VideoProvider>().updateWatchProgress(
-            widget.video.id,
-            pos,
-            dur,
-          );
+  void _startProgressUpdates() {
+    _progressTimer?.cancel();
+    _progressTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      final controller = _videoController;
+      if (controller == null) return;
+
+      final value = controller.value;
+      if (!value.isInitialized) return;
+      if (!value.isPlaying) return;
+
+      final dur = value.duration;
+      if (dur.inSeconds <= 0) return;
+
+      final posInSeconds = value.position.inSeconds;
+      if (posInSeconds == _lastProgressSecond) return;
+      _lastProgressSecond = posInSeconds;
+
+      _videoProvider.updateWatchProgress(
+        widget.video.id,
+        value.position,
+        dur,
+      );
+    });
+  }
+
+  Future<void> _loadInitialGestureValues() async {
+    try {
+      _brightnessLevel =
+          (await ScreenBrightness.instance.application).clamp(0.0, 1.0);
+    } catch (_) {
+      _brightnessLevel = 0.5;
     }
+  }
+
+  void _onPlayerPanStart(DragStartDetails details) {
+    _gestureDelta = Offset.zero;
+    _pendingSeekSeconds = 0;
+    _gestureAxis = _GestureAxis.none;
+    _verticalGestureMode = _VerticalGestureMode.none;
+    _isLeftSideGesture =
+        details.localPosition.dx < (MediaQuery.of(context).size.width / 2);
+    _gestureHudTimer?.cancel();
+  }
+
+  void _onPlayerPanUpdate(DragUpdateDetails details) {
+    _gestureDelta += details.delta;
+
+    if (_gestureAxis == _GestureAxis.none) {
+      if (_gestureDelta.distance < 8) return;
+
+      final isHorizontal = _gestureDelta.dx.abs() >= _gestureDelta.dy.abs();
+      _gestureAxis =
+          isHorizontal ? _GestureAxis.horizontal : _GestureAxis.vertical;
+
+      if (_gestureAxis == _GestureAxis.vertical) {
+        _verticalGestureMode = _isLeftSideGesture
+            ? _VerticalGestureMode.brightness
+            : _VerticalGestureMode.volume;
+      }
+    }
+
+    if (_gestureAxis == _GestureAxis.horizontal) {
+      _handleHorizontalGesture(details.delta.dx);
+    } else if (_gestureAxis == _GestureAxis.vertical) {
+      _handleVerticalGesture(details.delta.dy);
+    }
+  }
+
+  Future<void> _onPlayerPanEnd(DragEndDetails details) async {
+    if (_gestureAxis == _GestureAxis.horizontal) {
+      final controller = _videoController;
+      if (controller != null && controller.value.isInitialized) {
+        final value = controller.value;
+        final duration = value.duration;
+        final deltaSeconds = _pendingSeekSeconds.round();
+        if (duration.inSeconds > 0 && deltaSeconds != 0) {
+          final target = _clampPosition(
+            value.position + Duration(seconds: deltaSeconds),
+            duration,
+          );
+          await controller.seekTo(target);
+          _lastProgressSecond = target.inSeconds;
+          _videoProvider.updateWatchProgress(widget.video.id, target, duration);
+
+          final sign = deltaSeconds > 0 ? '+' : '';
+          _updateGestureHud(
+            icon: deltaSeconds > 0
+                ? Icons.fast_forward_rounded
+                : Icons.fast_rewind_rounded,
+            text: '$sign${deltaSeconds}s  ${_formatDuration(target)}',
+            value: duration.inMilliseconds > 0
+                ? (target.inMilliseconds / duration.inMilliseconds)
+                : 0,
+          );
+        }
+      }
+    }
+
+    _gestureAxis = _GestureAxis.none;
+    _verticalGestureMode = _VerticalGestureMode.none;
+    _pendingSeekSeconds = 0;
+    _scheduleGestureHudHide();
+  }
+
+  void _handleHorizontalGesture(double deltaX) {
+    _pendingSeekSeconds =
+        (_pendingSeekSeconds + (deltaX / 14)).clamp(-180, 180);
+    final seconds = _pendingSeekSeconds.round();
+    final sign = seconds >= 0 ? '+' : '';
+    _updateGestureHud(
+      icon:
+          seconds >= 0 ? Icons.fast_forward_rounded : Icons.fast_rewind_rounded,
+      text: '$sign${seconds}s',
+      value: 0,
+    );
+  }
+
+  void _handleVerticalGesture(double deltaY) {
+    final change = (-deltaY / 260).clamp(-0.08, 0.08).toDouble();
+
+    if (_verticalGestureMode == _VerticalGestureMode.brightness) {
+      _brightnessLevel = (_brightnessLevel + change).clamp(0.05, 1.0);
+      unawaited(
+        ScreenBrightness.instance
+            .setApplicationScreenBrightness(_brightnessLevel)
+            .catchError((_) {}),
+      );
+
+      _updateGestureHud(
+        icon: Icons.brightness_6_rounded,
+        text: 'Brightness ${(_brightnessLevel * 100).round()}%',
+        value: _brightnessLevel,
+      );
+      return;
+    }
+
+    if (_verticalGestureMode == _VerticalGestureMode.volume) {
+      _volumeLevel = (_volumeLevel + change).clamp(0.0, 1.0);
+      _videoController?.setVolume(_volumeLevel);
+
+      _updateGestureHud(
+        icon: _volumeLevel == 0
+            ? Icons.volume_off_rounded
+            : Icons.volume_up_rounded,
+        text: 'Volume ${(_volumeLevel * 100).round()}%',
+        value: _volumeLevel,
+      );
+    }
+  }
+
+  Duration _clampPosition(Duration value, Duration max) {
+    if (value < Duration.zero) return Duration.zero;
+    if (value > max) return max;
+    return value;
+  }
+
+  String _formatDuration(Duration value) {
+    final hours = value.inHours;
+    final minutes = value.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final seconds = value.inSeconds.remainder(60).toString().padLeft(2, '0');
+    if (hours > 0) {
+      return '$hours:$minutes:$seconds';
+    }
+    return '$minutes:$seconds';
+  }
+
+  void _updateGestureHud({
+    required IconData icon,
+    required String text,
+    required double value,
+  }) {
+    _gestureHudTimer?.cancel();
+    _gestureHudNotifier.value = _GestureHudData(
+      icon: icon,
+      label: text,
+      value: value.clamp(0.0, 1.0),
+    );
+  }
+
+  void _scheduleGestureHudHide() {
+    _gestureHudTimer?.cancel();
+    _gestureHudTimer = Timer(const Duration(milliseconds: 700), () {
+      _gestureHudNotifier.value = null;
+    });
   }
 
   @override
@@ -106,7 +322,24 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
       DeviceOrientation.landscapeRight,
     ]);
 
-    _videoController?.removeListener(_progressListener);
+    final value = _videoController?.value;
+    if (value != null && value.isInitialized && value.duration.inSeconds > 0) {
+      _videoProvider.updateWatchProgress(
+        widget.video.id,
+        value.position,
+        value.duration,
+        forcePersist: true,
+      );
+    }
+
+    _progressTimer?.cancel();
+    _gestureHudTimer?.cancel();
+    _gestureHudNotifier.dispose();
+    unawaited(
+      ScreenBrightness.instance
+          .resetApplicationScreenBrightness()
+          .catchError((_) {}),
+    );
     _chewieController?.dispose();
     _videoController?.dispose();
     super.dispose();
@@ -114,21 +347,23 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final isLandscape = _isLandscape(context);
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: Column(
         children: [
           // Video Player Area
-          Expanded(
-            flex: _isLandscape(context) ? 1 : 0,
-            child: Container(
-              color: Colors.black,
+          if (isLandscape)
+            Expanded(child: _buildPlayer())
+          else
+            SizedBox(
+              height: MediaQuery.of(context).size.width * 9 / 16 + 56,
               child: _buildPlayer(),
             ),
-          ),
 
           // Info Panel (portrait only)
-          if (!_isLandscape(context))
+          if (!isLandscape)
             Expanded(
               child: _buildInfoPanel(context),
             ),
@@ -143,21 +378,42 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
 
   Widget _buildPlayer() {
     if (_hasError) {
-      return _ErrorWidget(message: _errorMessage, onBack: () => Navigator.pop(context));
+      return _ErrorWidget(
+          message: _errorMessage, onBack: () => Navigator.pop(context));
     }
 
     if (!_isInitialized) {
-      return _LoadingWidget(video: widget.video, onBack: () => Navigator.pop(context));
+      return _LoadingWidget(
+          video: widget.video, onBack: () => Navigator.pop(context));
     }
 
-    return SizedBox(
-      width: double.infinity,
-      height: _isLandscape(context)
-          ? double.infinity
-          : MediaQuery.of(context).size.width * 9 / 16 + 56,
+    return SizedBox.expand(
       child: Stack(
         children: [
-          Chewie(controller: _chewieController!),
+          RepaintBoundary(
+            child: Chewie(controller: _chewieController!),
+          ),
+          Positioned.fill(
+            child: GestureDetector(
+              behavior: HitTestBehavior.translucent,
+              onPanStart: _onPlayerPanStart,
+              onPanUpdate: _onPlayerPanUpdate,
+              onPanEnd: _onPlayerPanEnd,
+            ),
+          ),
+          ValueListenableBuilder<_GestureHudData?>(
+            valueListenable: _gestureHudNotifier,
+            builder: (context, hud, _) {
+              if (hud == null) return const SizedBox.shrink();
+              return Center(
+                child: _GestureHud(
+                  icon: hud.icon,
+                  label: hud.label,
+                  value: hud.value,
+                ),
+              );
+            },
+          ),
           // Back button overlay
           Positioned(
             top: MediaQuery.of(context).padding.top + 8,
@@ -174,7 +430,7 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
   }
 
   Widget _buildInfoPanel(BuildContext context) {
-    final provider = context.watch<VideoProvider>();
+    final provider = _videoProvider;
 
     return Container(
       color: const Color(0xFF0A0A0F),
@@ -215,8 +471,12 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                           : Colors.white.withOpacity(0.08),
                     ),
                     child: Icon(
-                      _isFavorite ? Icons.favorite_rounded : Icons.favorite_border_rounded,
-                      color: _isFavorite ? const Color(0xFFE50914) : Colors.white54,
+                      _isFavorite
+                          ? Icons.favorite_rounded
+                          : Icons.favorite_border_rounded,
+                      color: _isFavorite
+                          ? const Color(0xFFE50914)
+                          : Colors.white54,
                       size: 22,
                     ),
                   ),
@@ -258,8 +518,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                       style: TextStyle(color: Colors.white54, fontSize: 13)),
                   Text(
                     '${(widget.video.watchProgress * 100).toInt()}% watched',
-                    style: const TextStyle(
-                        color: Color(0xFFE50914), fontSize: 13),
+                    style:
+                        const TextStyle(color: Color(0xFFE50914), fontSize: 13),
                   ),
                 ],
               ),
@@ -269,8 +529,8 @@ class _VideoPlayerScreenState extends State<VideoPlayerScreen> {
                 child: LinearProgressIndicator(
                   value: widget.video.watchProgress,
                   backgroundColor: Colors.white12,
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                      Color(0xFFE50914)),
+                  valueColor:
+                      const AlwaysStoppedAnimation<Color>(Color(0xFFE50914)),
                   minHeight: 6,
                 ),
               ),
@@ -396,6 +656,58 @@ class _ActionButton extends StatelessWidget {
             ),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _GestureHud extends StatelessWidget {
+  final IconData icon;
+  final String label;
+  final double value;
+
+  const _GestureHud({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 170,
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 12),
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.72),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, color: Colors.white, size: 22),
+          const SizedBox(height: 8),
+          Text(
+            label,
+            style: GoogleFonts.outfit(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+            ),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(999),
+            child: LinearProgressIndicator(
+              value: value,
+              minHeight: 4,
+              backgroundColor: Colors.white24,
+              valueColor:
+                  const AlwaysStoppedAnimation<Color>(Color(0xFFE50914)),
+            ),
+          ),
+        ],
       ),
     );
   }

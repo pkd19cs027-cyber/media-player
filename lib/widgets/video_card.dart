@@ -6,6 +6,9 @@ class VideoCard extends StatelessWidget {
   final VideoModel video;
   final VoidCallback onTap;
   final VoidCallback onFavorite;
+  final VoidCallback? onLongPress;
+  final bool showSelection;
+  final bool isSelected;
   final bool isGrid;
 
   const VideoCard({
@@ -13,6 +16,9 @@ class VideoCard extends StatelessWidget {
     required this.video,
     required this.onTap,
     required this.onFavorite,
+    this.onLongPress,
+    this.showSelection = false,
+    this.isSelected = false,
     this.isGrid = false,
   });
 
@@ -20,12 +26,18 @@ class VideoCard extends StatelessWidget {
   Widget build(BuildContext context) {
     return GestureDetector(
       onTap: onTap,
+      onLongPress: onLongPress,
       child: Container(
         width: isGrid ? null : 140,
         decoration: BoxDecoration(
           borderRadius: BorderRadius.circular(16),
           color: const Color(0xFF141420),
-          border: Border.all(color: Colors.white.withOpacity(0.06)),
+          border: Border.all(
+            color: isSelected
+                ? const Color(0xFFE50914)
+                : Colors.white.withOpacity(0.06),
+            width: isSelected ? 1.4 : 1,
+          ),
           boxShadow: [
             BoxShadow(
               color: Colors.black.withOpacity(0.4),
@@ -52,8 +64,7 @@ class VideoCard extends StatelessWidget {
                           begin: Alignment.topLeft,
                           end: Alignment.bottomRight,
                           colors: [
-                            _getColorFromTitle(video.title)
-                                .withOpacity(0.4),
+                            _getColorFromTitle(video.title).withOpacity(0.4),
                             const Color(0xFF0D0D18),
                           ],
                         ),
@@ -77,8 +88,7 @@ class VideoCard extends StatelessWidget {
                         decoration: BoxDecoration(
                           shape: BoxShape.circle,
                           color: Colors.black.withOpacity(0.5),
-                          border: Border.all(
-                              color: Colors.white54, width: 1.5),
+                          border: Border.all(color: Colors.white54, width: 1.5),
                         ),
                         child: const Icon(
                           Icons.play_arrow_rounded,
@@ -95,31 +105,65 @@ class VideoCard extends StatelessWidget {
                       child: _ExtBadge(ext: video.extension),
                     ),
 
-                    // Favorite button
-                    Positioned(
-                      top: 6,
-                      right: 6,
-                      child: GestureDetector(
-                        onTap: onFavorite,
+                    if (showSelection && isSelected)
+                      Positioned.fill(
                         child: Container(
-                          width: 32,
-                          height: 32,
+                          color: const Color(0x4DE50914),
+                        ),
+                      ),
+
+                    if (showSelection)
+                      Positioned(
+                        top: 8,
+                        right: 8,
+                        child: Container(
+                          width: 28,
+                          height: 28,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
-                            color: Colors.black54,
+                            color: isSelected
+                                ? const Color(0xFFE50914)
+                                : Colors.black54,
+                            border: Border.all(
+                              color: isSelected
+                                  ? const Color(0xFFFF6B35)
+                                  : Colors.white30,
+                            ),
                           ),
                           child: Icon(
-                            video.isFavorite
-                                ? Icons.favorite_rounded
-                                : Icons.favorite_border_rounded,
-                            color: video.isFavorite
-                                ? const Color(0xFFE50914)
-                                : Colors.white60,
-                            size: 16,
+                            isSelected
+                                ? Icons.check_rounded
+                                : Icons.circle_outlined,
+                            color: Colors.white,
+                            size: 15,
+                          ),
+                        ),
+                      )
+                    else
+                      Positioned(
+                        top: 6,
+                        right: 6,
+                        child: GestureDetector(
+                          onTap: onFavorite,
+                          child: Container(
+                            width: 32,
+                            height: 32,
+                            decoration: const BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Colors.black54,
+                            ),
+                            child: Icon(
+                              video.isFavorite
+                                  ? Icons.favorite_rounded
+                                  : Icons.favorite_border_rounded,
+                              color: video.isFavorite
+                                  ? const Color(0xFFE50914)
+                                  : Colors.white60,
+                              size: 16,
+                            ),
                           ),
                         ),
                       ),
-                    ),
 
                     // Progress bar
                     if (video.watchProgress > 0)
@@ -239,8 +283,7 @@ class ContinueWatchingCard extends StatelessWidget {
                     height: 52,
                     decoration: BoxDecoration(
                       borderRadius: BorderRadius.circular(10),
-                      color:
-                          _getColorFromTitle(video.title).withOpacity(0.2),
+                      color: _getColorFromTitle(video.title).withOpacity(0.2),
                     ),
                     child: const Icon(Icons.movie_rounded,
                         color: Colors.white54, size: 26),
@@ -267,9 +310,8 @@ class ContinueWatchingCard extends StatelessWidget {
                           child: LinearProgressIndicator(
                             value: video.watchProgress,
                             backgroundColor: Colors.white12,
-                            valueColor:
-                                const AlwaysStoppedAnimation<Color>(
-                                    Color(0xFFE50914)),
+                            valueColor: const AlwaysStoppedAnimation<Color>(
+                                Color(0xFFE50914)),
                             minHeight: 4,
                           ),
                         ),
